@@ -4,20 +4,23 @@ output_dir: "outputs"
 pretrained_model_path: "models/StableDiffusion/stable-diffusion-v1-5"
 
 unet_additional_kwargs:
+  use_inflated_groupnorm         : true
   use_motion_module              : true
   motion_module_resolutions      : [ 1,2,4,8 ]
   unet_use_cross_frame_attention : false
   unet_use_temporal_attention    : false
 
+  motion_module_mid_block: true
+  motion_module_decoder_only: false
   motion_module_type: Vanilla
   motion_module_kwargs:
     num_attention_heads                : 8
     num_transformer_block              : 1
     attention_block_types              : [ "Temporal_Self", "Temporal_Self" ]
     temporal_position_encoding         : true
-    temporal_position_encoding_max_len : 24
+    temporal_position_encoding_max_len : 32
     temporal_attention_dim_div         : 1
-    zero_initialize                    : true
+    zero_initialize                    : false
 
 noise_scheduler_kwargs:
   num_train_timesteps: 1000
@@ -28,8 +31,8 @@ noise_scheduler_kwargs:
   clip_sample:         false
 
 train_data:
-  csv_path:        "/mnt/petrelfs/guoyuwei/projects/datasets/webvid/results_2M_val.csv"
-  video_folder:    "/mnt/petrelfs/guoyuwei/projects/datasets/webvid/2M_val"
+  csv_path:        "/mnt/foxhole/webvid/results_2M_train.csv"
+  video_folder:    "/mnt/foxhole/webvid"
   sample_size:     256
   sample_stride:   4
   sample_n_frames: 16
@@ -46,7 +49,7 @@ validation_data:
 trainable_modules:
   - "motion_modules."
 
-unet_checkpoint_path: ""
+unet_checkpoint_path: "/mnt/sonic/AnimateDiff/models/Motion_Module/mm_sd_v15_v2.ckpt"
 
 learning_rate:    1.e-4
 train_batch_size: 4
