@@ -8,10 +8,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.modeling_utils import ModelMixin
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.models.attention import CrossAttention, FeedForward, AdaLayerNorm
+from diffusers.models.attention import Attention as CrossAttention, FeedForward, AdaLayerNorm
 
 from einops import rearrange, repeat
 import pdb
@@ -168,6 +168,7 @@ class BasicTransformerBlock(nn.Module):
         # SC-Attn
         assert unet_use_cross_frame_attention is not None
         if unet_use_cross_frame_attention:
+            raise NotImplementedError
             self.attn1 = SparseCausalAttention2D(
                 query_dim=dim,
                 heads=num_attention_heads,
