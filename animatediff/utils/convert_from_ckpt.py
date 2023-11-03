@@ -47,6 +47,10 @@ from diffusers.schedulers import (
     PNDMScheduler,
     UnCLIPScheduler,
 )
+from diffusers.pipelines.latent_diffusion.pipeline_latent_diffusion import LDMBertConfig, LDMBertModel
+from diffusers.pipelines.paint_by_example.image_encoder import PaintByExampleImageEncoder
+from diffusers.pipelines.stable_diffusion.stable_unclip_image_normalizer import StableUnCLIPImageNormalizer
+from diffusers.models.controlnet import ControlNetModel
 from diffusers.utils.import_utils import BACKENDS_MAPPING
 
 
