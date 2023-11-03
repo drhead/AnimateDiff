@@ -121,6 +121,7 @@ def main(
 
     mixed_precision_training: bool = True,
     enable_xformers_memory_efficient_attention: bool = True,
+    use_torch_compile: bool = False,
 
     global_seed: int = 42,
     is_debug: bool = False,
@@ -292,6 +293,12 @@ def main(
 
     # Train!
     total_batch_size = train_batch_size * num_processes * gradient_accumulation_steps
+
+    if use_torch_compile:
+        logging.info("***** Compiling models *****")
+        unet = torch.compile(unet)
+        text_encoder = torch.compile(text_encoder)
+        vae = torch.compile(vae)
 
     if is_main_process:
         logging.info("***** Running training *****")
