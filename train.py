@@ -34,6 +34,8 @@ from diffusers.utils.import_utils import is_xformers_available
 import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
 
+import bitsandbytes as bnb
+
 from animatediff.data.dataset import WebVid10M
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
@@ -198,8 +200,9 @@ def main(
                 break
             
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    optimizer = torch.optim.AdamW(
-        trainable_params,
+    # optimizer = torch.optim.AdamW(
+    optimizer = bnb.optim.AdamW8bit(
+	trainable_params,
         lr=learning_rate,
         betas=(adam_beta1, adam_beta2),
         weight_decay=adam_weight_decay,
