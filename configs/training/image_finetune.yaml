@@ -10,10 +10,14 @@ noise_scheduler_kwargs:
   beta_schedule:       "scaled_linear"
   steps_offset:        1
   clip_sample:         false
+  # Following settings will change for zero SNR training.
+  prediction_type:         "epsilon" # Default: "epsilon", ZSNR: "v_prediction"
+  timestep_spacing:        "leading" # Default: "leading", ZSNR: "trailing"
+  rescale_betas_zero_snr:  false     # Default: false,     ZSNR: true
 
 train_data:
-  csv_path:     "/mnt/petrelfs/guoyuwei/projects/datasets/webvid/results_2M_val.csv"
-  video_folder: "/mnt/petrelfs/guoyuwei/projects/datasets/webvid/2M_val"
+  csv_path:        "/mnt/foxhole/webvid/results_2M_train.csv"
+  video_folder:    "/mnt/foxhole/webvid"
   sample_size:  256
 
 validation_data:
