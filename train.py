@@ -74,7 +74,31 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     
     return local_rank
 
+def prepare_scheduler_for_custom_training(noise_scheduler):
+    if hasattr(noise_scheduler, "all_snr"):
+        return
 
+    standard_noise_scheduler = DDIMScheduler(
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="linear",
+        num_train_timesteps=1000,
+        prediction_type=noise_scheduler.prediction_type
+    )
+
+    alpha_bar = standard_noise_scheduler.alphas_cumprod
+    noise_scheduler.all_snr = torch.divide(alpha_bar, torch.subtract(1, alpha_bar)).to(alpha_bar.device)
+
+def apply_snr_weight(loss, timesteps, noise_scheduler, gamma):
+
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma)).float()
+    if (noise_scheduler.prediction_type == "v_prediction"):
+        snr_weight = torch.divide(min_snr_gamma, snr + 1).float().to(loss.device)
+    else:
+        snr_weight = torch.divide(min_snr_gamma, snr).float().to(loss.device)
+
+    return loss * snr_weight
 
 def main(
     image_finetune: bool,
@@ -107,7 +131,7 @@ def main(
     lr_scheduler: str = "constant",
 
     trainable_modules: Tuple[str] = (None, ),
-    num_workers: int = 32,
+    num_workers: int = 12,
     train_batch_size: int = 1,
     adam_beta1: float = 0.9,
     adam_beta2: float = 0.999,
@@ -118,6 +142,8 @@ def main(
     gradient_checkpointing: bool = False,
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
+    min_snr_gamma: float = None,
+    ip_noise_gamma: float = 0.0,
 
     mixed_precision_training: bool = True,
     enable_xformers_memory_efficient_attention: bool = True,
@@ -136,7 +162,10 @@ def main(
 
     seed = global_seed + global_rank
     torch.manual_seed(seed)
+    torch.set_float32_matmul_precision('high')
     
+    if scale_lr:
+        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
     # Logging folder
     folder_name = "debug" if is_debug else name + datetime.datetime.now().strftime("-%Y-%m-%dT%H-%M-%S")
     output_dir = os.path.join(output_dir, folder_name)
@@ -165,7 +194,7 @@ def main(
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
-
+    prepare_scheduler_for_custom_training(noise_scheduler)
     vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
     tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
@@ -179,15 +208,17 @@ def main(
         
     # Load pretrained unet weights
     if unet_checkpoint_path != "":
-        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
+        print(f"from checkpoint: {unet_checkpoint_path}")
         unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
-        if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
+        if "global_step" in unet_checkpoint_path: print(f"global_step: {unet_checkpoint_path['global_step']}")
         state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
 
         m, u = unet.load_state_dict(state_dict, strict=False)
-        zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
         assert len(u) == 0
         
+    # for name, param in vae.state_dict().items():
+    #     print(f"Parameter Name: {name}, Shape: {param.shape}, Dtype: {param.dtype}, Nonzeros: {torch.count_nonzero(param)}")
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -223,6 +254,9 @@ def main(
 
     # Enable gradient checkpointing
     if gradient_checkpointing:
+        from functools import partial
+        notfailing_checkpoint = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+        torch.utils.checkpoint.checkpoint = notfailing_checkpoint
         unet.enable_gradient_checkpointing()
 
     # Move models to GPU
@@ -259,9 +293,6 @@ def main(
         assert checkpointing_epochs != -1
         checkpointing_steps = checkpointing_epochs * len(train_dataloader)
 
-    if scale_lr:
-        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
-
     # Scheduler
     lr_scheduler = get_scheduler(
         lr_scheduler,
@@ -282,9 +313,10 @@ def main(
         )
     validation_pipeline.enable_vae_slicing()
 
+    unet.to("cuda")
     # DDP warpper
-    unet.to(local_rank)
-    unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
+    # unet.to(local_rank)
+    # unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
@@ -366,7 +398,11 @@ def main(
             
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            noisy_latents = noise_scheduler.add_noise(
+                latents, 
+                noise + ip_noise_gamma * torch.randn(latents.shape, device=latents.device), 
+                timesteps
+                )
             
             # Get the text embedding for conditioning
             with torch.no_grad():
@@ -387,7 +423,13 @@ def main(
             # Mixed-precision training
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                if min_snr_gamma:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean([1, 2, 3, 4])
+                    loss = apply_snr_weight(loss, timesteps, noise_scheduler, min_snr_gamma)
+                    loss = loss.mean()
+                else:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             optimizer.zero_grad()
 
@@ -467,7 +509,7 @@ def main(
                         ).images[0]
                         sample = torchvision.transforms.functional.to_tensor(sample)
                         samples.append(sample)
-                
+
                 if not image_finetune:
                     samples = torch.concat(samples)
                     save_path = f"{output_dir}/samples/sample-{global_step}.gif"

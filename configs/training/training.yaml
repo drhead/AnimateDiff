@@ -1,6 +1,6 @@
 image_finetune: false
 
-output_dir: "outputs"
+output_dir: "outputs/WebVid-test"
 pretrained_model_path: "models/StableDiffusion/stable-diffusion-v1-5"
 
 unet_additional_kwargs:
@@ -20,7 +20,7 @@ unet_additional_kwargs:
     temporal_position_encoding         : true
     temporal_position_encoding_max_len : 32
     temporal_attention_dim_div         : 1
-    zero_initialize                    : false
+    zero_initialize                    : true
 
 noise_scheduler_kwargs:
   num_train_timesteps:     1000
@@ -31,13 +31,13 @@ noise_scheduler_kwargs:
   clip_sample:             false
   # Following settings will change for zero SNR training.
   prediction_type:         "epsilon" # Default: "epsilon", ZSNR: "v_prediction"
-  timestep_spacing:        "leading" # Default: "leading", ZSNR: "trailing"
+  timestep_spacing:        "trailing" # Default: "leading", ZSNR: "trailing"
   rescale_betas_zero_snr:  false     # Default: false,     ZSNR: true
 
 train_data:
-  csv_path:        "/mnt/foxhole/webvid/results_2M_train.csv"
+  csv_path:        "/mnt/foxhole/webvid/dataset.csv"
   video_folder:    "/mnt/foxhole/webvid"
-  sample_size:     256
+  sample_size:     512
   sample_stride:   4
   sample_n_frames: 16
 
@@ -56,18 +56,25 @@ trainable_modules:
 unet_checkpoint_path: "/mnt/sonic/AnimateDiff/models/Motion_Module/mm_sd_v15_v2.ckpt"
 
 learning_rate:    1.e-4
-train_batch_size: 4
+scale_lr: false
+train_batch_size: 6
+gradient_accumulation_steps: 4
+use_torch_compile: false
+min_snr_gamma: 5
+ip_noise_gamma: 0.1
+
+gradient_checkpointing: true
 
 max_train_epoch:      -1
-max_train_steps:      100
+max_train_steps:      10000
 checkpointing_epochs: -1
-checkpointing_steps:  60
+checkpointing_steps:  5000
 
-validation_steps:       5000
+validation_steps:       500
 validation_steps_tuple: [2, 50]
 
 global_seed: 42
 mixed_precision_training: true
-enable_xformers_memory_efficient_attention: True
+enable_xformers_memory_efficient_attention: false
 
 is_debug: False
