@@ -13,15 +13,18 @@ from tqdm.auto import tqdm
 from einops import rearrange
 from omegaconf import OmegaConf
 from safetensors import safe_open
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torchvision
+import torchvision.transforms.functional
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.optim.swa_utils import AveragedModel
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, RandomSampler
+import torch.utils.checkpoint
+import torch.backends.cuda
+from torch.optim.optimizer import Optimizer
 
 import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -39,42 +42,16 @@ import bitsandbytes as bnb
 from animatediff.data.dataset import WebVid10M
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
-from animatediff.utils.util import save_videos_grid, zero_rank_print
+from animatediff.pipelines.dynthresh_core import DynThresh
+from animatediff.utils.util import save_videos_grid
 
 
+from adan import Adan
+from prodigyopt import Prodigy
 
-def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
-    """Initializes distributed environment."""
-    if launcher == 'pytorch':
-        rank = int(os.environ['RANK'])
-        num_gpus = torch.cuda.device_count()
-        local_rank = rank % num_gpus
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=backend, **kwargs)
-        
-    elif launcher == 'slurm':
-        proc_id = int(os.environ['SLURM_PROCID'])
-        ntasks = int(os.environ['SLURM_NTASKS'])
-        node_list = os.environ['SLURM_NODELIST']
-        num_gpus = torch.cuda.device_count()
-        local_rank = proc_id % num_gpus
-        torch.cuda.set_device(local_rank)
-        addr = subprocess.getoutput(
-            f'scontrol show hostname {node_list} | head -n1')
-        os.environ['MASTER_ADDR'] = addr
-        os.environ['WORLD_SIZE'] = str(ntasks)
-        os.environ['RANK'] = str(proc_id)
-        port = os.environ.get('PORT', port)
-        os.environ['MASTER_PORT'] = str(port)
-        dist.init_process_group(backend=backend)
-        zero_rank_print(f"proc_id: {proc_id}; local_rank: {local_rank}; ntasks: {ntasks}; node_list: {node_list}; num_gpus: {num_gpus}; addr: {addr}; port: {port}")
-        
-    else:
-        raise NotImplementedError(f'Not implemented launcher type: `{launcher}`!')
-    
-    return local_rank
+from accelerate import Accelerator
 
-def prepare_scheduler_for_custom_training(noise_scheduler):
+def prepare_scheduler_for_custom_training(noise_scheduler: DDIMScheduler):
     if hasattr(noise_scheduler, "all_snr"):
         return
 
@@ -87,16 +64,16 @@ def prepare_scheduler_for_custom_training(noise_scheduler):
     )
 
     alpha_bar = standard_noise_scheduler.alphas_cumprod
-    noise_scheduler.all_snr = torch.divide(alpha_bar, torch.subtract(1, alpha_bar)).to(alpha_bar.device)
+    noise_scheduler.all_snr = torch.divide(alpha_bar, torch.subtract(1, alpha_bar)).to(alpha_bar.device) # type: torch.Tensor
 
-def apply_snr_weight(loss, timesteps, noise_scheduler, gamma):
+def apply_snr_weight(loss: torch.Tensor, timesteps: torch.Tensor, noise_scheduler: DDIMScheduler, gamma: float) -> torch.Tensor:
 
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma)).float()
-    if (noise_scheduler.prediction_type == "v_prediction"):
-        snr_weight = torch.divide(min_snr_gamma, snr + 1).float().to(loss.device)
+    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+    if (noise_scheduler.config.prediction_type == "v_prediction"):
+        snr_weight = torch.divide(min_snr_gamma, snr + 1).to(loss.device)
     else:
-        snr_weight = torch.divide(min_snr_gamma, snr).float().to(loss.device)
+        snr_weight = torch.divide(min_snr_gamma, snr).to(loss.device)
 
     return loss * snr_weight
 
@@ -145,27 +122,60 @@ def main(
     min_snr_gamma: float = None,
     ip_noise_gamma: float = 0.0,
 
-    mixed_precision_training: bool = True,
+    mixed_precision_training: str = "fp16",
     enable_xformers_memory_efficient_attention: bool = True,
     use_torch_compile: bool = False,
-
+    channels_last: bool = False,
+    do_profile: bool = False,
     global_seed: int = 42,
     is_debug: bool = False,
+    rescale_cfg: float = 0.0,
+    wandb_scale_factor: int = 1,
 ):
     check_min_version("0.10.0.dev0")
 
-    # Initialize distributed training
-    local_rank      = init_dist(launcher=launcher)
-    global_rank     = dist.get_rank()
-    num_processes   = dist.get_world_size()
-    is_main_process = global_rank == 0
+    if use_torch_compile:
+        dynamo = "INDUCTOR"
+    else:
+        dynamo = "NO"
 
-    seed = global_seed + global_rank
-    torch.manual_seed(seed)
+    # Initialize Accelerate
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision_training,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        dynamo_backend=dynamo
+    )
+    device = accelerator.device
+
+    torch.manual_seed(global_seed)
+    # A100-specific optimizations
     torch.set_float32_matmul_precision('high')
-    
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
+    # Get the training dataset
+    train_dataset = WebVid10M(**train_data, is_image=image_finetune)
+
+    random_sampler = RandomSampler(
+        train_dataset, 
+        replacement=True,
+        num_samples=gradient_accumulation_steps * max_train_steps
+    )
+    # DataLoaders creation:
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size,
+        shuffle=False,
+        sampler=random_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
     if scale_lr:
-        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size * num_processes)
+        learning_rate = (learning_rate * gradient_accumulation_steps * train_batch_size)
     # Logging folder
     folder_name = "debug" if is_debug else name + datetime.datetime.now().strftime("-%Y-%m-%dT%H-%M-%S")
     output_dir = os.path.join(output_dir, folder_name)
@@ -181,30 +191,29 @@ def main(
         level=logging.INFO,
     )
 
-    if is_main_process and (not is_debug) and use_wandb:
-        run = wandb.init(project="animatediff", name=folder_name, config=config)
+    if (not is_debug) and use_wandb:
+        run = wandb.init(project="animatediff", config=config)
 
     # Handle the output folder creation
-    if is_main_process:
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(f"{output_dir}/samples", exist_ok=True)
-        os.makedirs(f"{output_dir}/sanity_check", exist_ok=True)
-        os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
-        OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(f"{output_dir}/samples", exist_ok=True)
+    os.makedirs(f"{output_dir}/sanity_check", exist_ok=True)
+    os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
+    # OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs))
+    noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs)) # type: DDIMScheduler
     prepare_scheduler_for_custom_training(noise_scheduler)
-    vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
-    tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
+    vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae") # type: AutoencoderKL
+    tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer") # type: CLIPTokenizer
+    text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder") # type: CLIPTextModel
     if not image_finetune:
         unet = UNet3DConditionModel.from_pretrained_2d(
             pretrained_model_path, subfolder="unet", 
             unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
-        )
+        ) # type: Union[UNet3DConditionModel, UNet2DConditionModel]
     else:
-        unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+        unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet") # type: Union[UNet3DConditionModel, UNet2DConditionModel]
         
     # Load pretrained unet weights
     if unet_checkpoint_path != "":
@@ -232,18 +241,95 @@ def main(
                 break
             
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    print(f"trainable params number: {len(trainable_params)}")
+    print(f"trainable params scale: {sum(p.numel() for p in trainable_params) / 1e6:.3f} M")
     # optimizer = torch.optim.AdamW(
-    optimizer = bnb.optim.AdamW8bit(
-	trainable_params,
-        lr=learning_rate,
-        betas=(adam_beta1, adam_beta2),
-        weight_decay=adam_weight_decay,
-        eps=adam_epsilon,
-    )
+    # optimizer = bnb.optim.AdamW8bit(
+	#     trainable_params,
+    #     lr=learning_rate,
+    #     betas=(adam_beta1, adam_beta2),
+    #     weight_decay=adam_weight_decay,
+    #     eps=adam_epsilon,
+    # )
+    decay_parameters = [n for n, p in unet.named_parameters() if p.requires_grad]
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
+    decay_parameters = [name for name in decay_parameters if "norm" not in name]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in unet.named_parameters() if n in decay_parameters and p.requires_grad],
+            "weight_decay": adam_weight_decay,
+        },
+        {
+            "params": [p for n, p in unet.named_parameters() if n not in decay_parameters and p.requires_grad],
+            "weight_decay": 0.0,
+        },
+    ]
 
-    if is_main_process:
-        zero_rank_print(f"trainable params number: {len(trainable_params)}")
-        zero_rank_print(f"trainable params scale: {sum(p.numel() for p in trainable_params) / 1e6:.3f} M")
+    # optimizer_cls = Adan
+    # optimizer_kwargs = {
+    #     "fused": True,
+    # }
+    optimizer_cls = Prodigy
+    optimizer_kwargs = {
+        "weight_decay": 0.01,
+        "use_bias_correction": True,
+        "lr": 1.0
+    }
+    # optimizer_kwargs["lr"] = learning_rate
+
+    optimizer = optimizer_cls(trainable_params, **optimizer_kwargs) # type: Adan
+    # class CustomOptimizerWrapper(Optimizer):
+    #     def __init__(self, model_parameters, lr, weight_decay, exclude_params):
+    #         for param in model_parameters:
+    #             for excluded_param_name in exclude_params:
+    #                 if excluded_param_name in param.param_name:
+    #                     param.use_weight_decay = False
+    #                     break
+    #                 else:
+    #                     param.use_weight_decay = True
+    #         list(filter(lambda p: p.use_weight_decay, model_parameters))
+    #         self.optimizer_with_decay = Adan(
+    #             list(filter(lambda p: p.use_weight_decay, model_parameters)),
+    #             lr=lr,
+    #             weight_decay=weight_decay,
+    #             fused=True
+    #         )
+            
+    #         self.optimizer_no_decay = Adan(
+    #             list(filter(lambda p: not p.use_weight_decay, model_parameters)),
+    #             lr=lr,
+    #             fused=True
+    #         )
+
+    #         self.param_groups = [{'params': self.optimizer_with_decay.param_groups}, {'params': self.optimizer_no_decay.param_groups}]
+
+    #     def zero_grad(self):
+    #         self.optimizer_with_decay.zero_grad()
+    #         self.optimizer_no_decay.zero_grad()
+
+    #     def step(self, closure=None):
+    #         if closure is not None:
+    #             loss = closure()
+    #         else:
+    #             loss = None
+
+    #         self.optimizer_with_decay.step()
+    #         self.optimizer_no_decay.step()
+
+    #         return loss
+
+    # # optimizer = Adan(
+	# #     trainable_params,
+    # #     lr=learning_rate,
+    # #     weight_decay=adam_weight_decay,
+    # # ) # type: Adan
+    # optimizer = CustomOptimizerWrapper(
+    #     trainable_params,
+    #     lr=learning_rate,
+    #     weight_decay=adam_weight_decay,
+    #     exclude_params=['norm', 'bias']
+    # )
+
 
     # Enable xformers
     if enable_xformers_memory_efficient_attention:
@@ -260,29 +346,8 @@ def main(
         unet.enable_gradient_checkpointing()
 
     # Move models to GPU
-    vae.to(local_rank)
-    text_encoder.to(local_rank)
-
-    # Get the training dataset
-    train_dataset = WebVid10M(**train_data, is_image=image_finetune)
-    distributed_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=num_processes,
-        rank=global_rank,
-        shuffle=True,
-        seed=global_seed,
-    )
-
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=train_batch_size,
-        shuffle=False,
-        sampler=distributed_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    vae.to(device, dtype=torch.float16)
+    text_encoder.to(device, dtype=torch.float16)
 
     # Get the training iteration
     if max_train_steps == -1:
@@ -294,18 +359,18 @@ def main(
         checkpointing_steps = checkpointing_epochs * len(train_dataloader)
 
     # Scheduler
-    lr_scheduler = get_scheduler(
-        lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=lr_warmup_steps * gradient_accumulation_steps,
-        num_training_steps=max_train_steps * gradient_accumulation_steps,
-    )
+    # lr_scheduler = get_scheduler(
+    #     lr_scheduler,
+    #     optimizer=optimizer,
+    #     num_warmup_steps=lr_warmup_steps
+    # ) # type: torch.optim.lr_scheduler.LRScheduler
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_train_steps // gradient_accumulation_steps) # type: torch.optim.lr_scheduler.LRScheduler
 
     # Validation pipeline
     if not image_finetune:
         validation_pipeline = AnimationPipeline(
             unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
-        ).to("cuda")
+        ).to(device)
     else:
         validation_pipeline = StableDiffusionPipeline.from_pretrained(
             pretrained_model_path,
@@ -313,10 +378,27 @@ def main(
         )
     validation_pipeline.enable_vae_slicing()
 
-    unet.to("cuda")
-    # DDP warpper
-    # unet.to(local_rank)
-    # unet = DDP(unet, device_ids=[local_rank], output_device=local_rank)
+    dynthresh = DynThresh(
+        mimic_scale=7.5,
+        threshold_percentile=1.0,
+        mimic_mode="Half Cosine Up",
+        mimic_scale_min=6.0,
+        cfg_mode="Half Cosine Up",
+        cfg_scale_min=6.0,
+        sched_val=None,
+        experiment_mode=None,
+        max_steps=25,
+        separate_feature_channels=True,
+        scaling_startpoint="MEAN",
+        variability_measure="AD",
+        interpolate_phi=1.0
+    )
+
+    unet.to(device)
+
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
+    )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
@@ -324,64 +406,89 @@ def main(
     num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
     # Train!
-    total_batch_size = train_batch_size * num_processes * gradient_accumulation_steps
+    total_batch_size = train_batch_size * gradient_accumulation_steps
 
-    if use_torch_compile:
-        logging.info("***** Compiling models *****")
-        unet = torch.compile(unet)
-        text_encoder = torch.compile(text_encoder)
-        vae = torch.compile(vae)
+    if channels_last:
+        vae.to(memory_format=torch.channels_last)
+        text_encoder.to(memory_format=torch.channels_last)
+        unet.to(memory_format=torch.channels_last)
+    
+    vae = torch.compile(vae)
+    text_encoder = torch.compile(text_encoder)
 
-    if is_main_process:
-        logging.info("***** Running training *****")
-        logging.info(f"  Num examples = {len(train_dataset)}")
-        logging.info(f"  Num Epochs = {num_train_epochs}")
-        logging.info(f"  Instantaneous batch size per device = {train_batch_size}")
-        logging.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-        logging.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
-        logging.info(f"  Total optimization steps = {max_train_steps}")
+    logging.info("***** Running training *****")
+    logging.info(f"  Num examples = {len(train_dataset)}")
+    logging.info(f"  Num Epochs = {num_train_epochs}")
+    logging.info(f"  Instantaneous batch size per device = {train_batch_size}")
+    logging.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logging.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
+    logging.info(f"  Total optimization steps = {max_train_steps}")
     global_step = 0
-    first_epoch = 0
-
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, max_train_steps), disable=not is_main_process)
+    grad_update_loss = 0
+    loss_accumulator = 0
+    do_grad_update = False
+    progress_bar = tqdm(range(global_step, max_train_steps), smoothing=1.0)
     progress_bar.set_description("Steps")
 
-    # Support mixed-precision training
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision_training else None
-
-    for epoch in range(first_epoch, num_train_epochs):
-        train_dataloader.sampler.set_epoch(epoch)
-        unet.train()
-        
-        for step, batch in enumerate(train_dataloader):
+    if do_profile:
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1,
+                warmup=1,
+                active=2,
+                repeat=1
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join("./tensorboard", folder_name)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True
+        )
+        profiler.start()
+    
+    unet.train()
+    
+    for batch in train_dataloader:
+        with accelerator.accumulate(unet):
+            if channels_last:
+                pass
+                # batch['pixel_values'] = batch['pixel_values'].to(memory_format=torch.channels_last_3d)
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
                 
             # Data batch sanity check
-            if epoch == first_epoch and step == 0:
+            if global_step == 0:
                 pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
                     for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
                         pixel_value = pixel_value[None, ...]
-                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
+                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'-{idx}'}.gif", rescale=True)
                 else:
                     for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
                         pixel_value = pixel_value / 2. + 0.5
-                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
+                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'-{idx}'}.png")
                     
             ### >>>> Training >>>> ###
             
             # Convert videos to latent space            
-            pixel_values = batch["pixel_values"].to(local_rank)
+            pixel_values = batch["pixel_values"].half() # type: torch.Tensor
             video_length = pixel_values.shape[1]
             with torch.no_grad():
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                    if channels_last:
+                        pixel_values = pixel_values.to(memory_format=torch.channels_last)
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
                     latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+                    if channels_last:
+                        assert latents.is_contiguous(memory_format=torch.channels_last_3d)
                 else:
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
@@ -393,14 +500,15 @@ def main(
             bsz = latents.shape[0]
             
             # Sample a random timestep for each video
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device)
             timesteps = timesteps.long()
             
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
+            # NOTE: Review ip noise gamma paper and implementation
             noisy_latents = noise_scheduler.add_noise(
                 latents, 
-                noise + ip_noise_gamma * torch.randn(latents.shape, device=latents.device), 
+                noise + ip_noise_gamma * torch.randn(latents.shape, device=device), 
                 timesteps
                 )
             
@@ -408,9 +516,9 @@ def main(
             with torch.no_grad():
                 prompt_ids = tokenizer(
                     batch['text'], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-                ).input_ids.to(latents.device)
-                encoder_hidden_states = text_encoder(prompt_ids)[0]
-                
+                ).input_ids.to(device) # type: torch.Tensor
+                encoder_hidden_states = text_encoder(prompt_ids)[0] # type: torch.Tensor
+
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
@@ -418,73 +526,82 @@ def main(
                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-            # Predict the noise residual and compute loss
+            noisy_latents = noisy_latents.half()
             # Mixed-precision training
-            with torch.cuda.amp.autocast(enabled=mixed_precision_training):
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            with accelerator.autocast():
+                # Predict the noise residual and compute loss
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample # type: torch.Tensor
+
                 if min_snr_gamma:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = F.mse_loss(model_pred, target, reduction="none")
                     loss = loss.mean([1, 2, 3, 4])
                     loss = apply_snr_weight(loss, timesteps, noise_scheduler, min_snr_gamma)
                     loss = loss.mean()
                 else:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    loss = F.mse_loss(model_pred, target, reduction="mean")
 
-            optimizer.zero_grad()
+            accelerator.backward(loss)
 
-            # Backpropagate
-            if mixed_precision_training:
-                scaler.scale(loss).backward()
-                """ >>> gradient clipping >>> """
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                """ <<< gradient clipping <<< """
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                """ >>> gradient clipping >>> """
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
-                """ <<< gradient clipping <<< """
-                optimizer.step()
+            do_grad_update = accelerator.sync_gradients
+            if do_grad_update:
+                accelerator.clip_grad_norm_(unet.parameters(), max_grad_norm)
+
+            optimizer.step()
 
             lr_scheduler.step()
+            optimizer.zero_grad()
+            if do_profile:
+                profiler.step()
             progress_bar.update(1)
             global_step += 1
-            
+            grad_update_loss += loss.item()
+            loss_accumulator += loss.item()
+
+            if global_step == 512:
+                for name, param in unet.named_parameters():
+                    if any(freeze_layer in name for freeze_layer in ["conv_"]):
+                        param.requires_grad = False
             ### <<<< Training <<<< ###
             
             # Wandb logging
-            if is_main_process and (not is_debug) and use_wandb:
-                wandb.log({"train_loss": loss.item()}, step=global_step)
-                
+            if (not is_debug) and use_wandb:
+                if global_step % wandb_scale_factor == 0:
+                    wandb.log({"train_loss": loss_accumulator / wandb_scale_factor}, step=global_step // wandb_scale_factor)
+                    loss_accumulator = 0
+                    if do_grad_update:
+                        wandb.log({
+                            "grad_update_loss": grad_update_loss / gradient_accumulation_steps,
+                            "lr": lr_scheduler.optimizers[0].param_groups[0]["d"] * lr_scheduler.optimizers[0].param_groups[0]["lr"]
+                            }, step=global_step // wandb_scale_factor)
+                        grad_update_loss = 0
+
             # Save checkpoint
-            if is_main_process and (global_step % checkpointing_steps == 0 or step == len(train_dataloader) - 1):
+            if (global_step % checkpointing_steps == 0 or global_step == len(train_dataloader) - 1):
                 save_path = os.path.join(output_dir, f"checkpoints")
                 state_dict = {
-                    "epoch": epoch,
+                    "epoch": 1,
                     "global_step": global_step,
-                    "state_dict": unet.state_dict(),
+                    "state_dict": accelerator.unwrap_model(unet).state_dict(), 
                 }
-                if step == len(train_dataloader) - 1:
-                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-epoch-{epoch+1}.ckpt"))
+                if global_step != len(train_dataloader) - 1:
+                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-step-{global_step // wandb_scale_factor}.ckpt"))
                 else:
                     torch.save(state_dict, os.path.join(save_path, f"checkpoint.ckpt"))
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
                 
             # Periodically validation
-            if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
+            if (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
                 samples = []
                 
-                generator = torch.Generator(device=latents.device)
+                generator = torch.Generator(device=device)
                 generator.manual_seed(global_seed)
                 
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
                 width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
 
-                prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
+                prompts = validation_data.prompts if global_step < 1000 and (not image_finetune) else validation_data.prompts
 
+                # Produce validation samples based on provided prompts
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
                         sample = validation_pipeline(
@@ -493,11 +610,14 @@ def main(
                             video_length = train_data.sample_n_frames,
                             height       = height,
                             width        = width,
+                            guidance_rescale = rescale_cfg,
+                            dynamic_thresholding = dynthresh,
                             **validation_data,
                         ).videos
-                        save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
+                        if use_wandb:
+                            wandb.log({f"video{idx}": wandb.Video((sample.transpose(1,2).squeeze() * 255).numpy().astype(np.uint8), prompt, fps=8, format="mp4")}, step=global_step // wandb_scale_factor)
+                        save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step // wandb_scale_factor}/{idx}.gif")
                         samples.append(sample)
-                        
                     else:
                         sample = validation_pipeline(
                             prompt,
@@ -510,25 +630,23 @@ def main(
                         sample = torchvision.transforms.functional.to_tensor(sample)
                         samples.append(sample)
 
+                # Save image/video samples to directory
                 if not image_finetune:
                     samples = torch.concat(samples)
-                    save_path = f"{output_dir}/samples/sample-{global_step}.gif"
+                    save_path = f"{output_dir}/samples/sample-{global_step // wandb_scale_factor}.gif"
                     save_videos_grid(samples, save_path)
-                    
                 else:
                     samples = torch.stack(samples)
-                    save_path = f"{output_dir}/samples/sample-{global_step}.png"
+                    save_path = f"{output_dir}/samples/sample-{global_step // wandb_scale_factor}.png"
                     torchvision.utils.save_image(samples, save_path, nrow=4)
-
                 logging.info(f"Saved samples to {save_path}")
                 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.item(), "lr": lr_scheduler.optimizers[0].param_groups[0]["d"] * lr_scheduler.optimizers[0].param_groups[0]["lr"]}
             progress_bar.set_postfix(**logs)
-            
+
             if global_step >= max_train_steps:
                 break
             
-    dist.destroy_process_group()
 
 
 

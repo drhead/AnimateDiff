@@ -1,7 +1,7 @@
 image_finetune: false
 
 output_dir: "outputs/WebVid-test"
-pretrained_model_path: "models/StableDiffusion/stable-diffusion-v1-5"
+pretrained_model_path: "models/StableDiffusion/zerodiffusion-v0-9"
 
 unet_additional_kwargs:
   use_inflated_groupnorm         : true
@@ -26,17 +26,17 @@ noise_scheduler_kwargs:
   num_train_timesteps:     1000
   beta_start:              0.00085
   beta_end:                0.012
-  beta_schedule:           "linear"
+  beta_schedule:           "scaled_linear"
   steps_offset:            1
   clip_sample:             false
   # Following settings will change for zero SNR training.
-  prediction_type:         "epsilon" # Default: "epsilon", ZSNR: "v_prediction"
+  prediction_type:         "v_prediction" # Default: "epsilon", ZSNR: "v_prediction"
   timestep_spacing:        "trailing" # Default: "leading", ZSNR: "trailing"
-  rescale_betas_zero_snr:  false     # Default: false,     ZSNR: true
+  rescale_betas_zero_snr:  true     # Default: false,     ZSNR: true
 
 train_data:
-  csv_path:        "/mnt/foxhole/webvid/dataset.csv"
-  video_folder:    "/mnt/foxhole/webvid"
+  csv_path:        "/mnt/foxhole/webvid_clean/results_2M_train.csv"
+  video_folder:    "/mnt/foxhole/webvid_clean_mt090"
   sample_size:     512
   sample_stride:   4
   sample_n_frames: 16
@@ -44,38 +44,55 @@ train_data:
 validation_data:
   prompts:
     - "Snow rocky mountains peaks canyon. Snow blanketed rocky mountains surround and shadow deep canyons."
-    - "A drone view of celebration with Christma tree and fireworks, starry sky - background."
+    - "A drone view of celebration with Christmas tree and fireworks, starry sky - background."
     - "Robot dancing in times square."
+    - "Two people walking down the street during a rainstorm."
     - "Pacific coast, carmel by the sea ocean and waves."
+    - "A robot dancing in a park"
+    - "Formula One racecar driving across finish line"
+    - "Blonde female model, white shirt, white pants, white background, studio"
   num_inference_steps: 25
   guidance_scale: 8.
 
 trainable_modules:
-  - "motion_modules."
+  - "to_q"
+  - "proj_"
 
 unet_checkpoint_path: "/mnt/sonic/AnimateDiff/models/Motion_Module/mm_sd_v15_v2.ckpt"
 
-learning_rate:    0.e-4
+learning_rate:     1.0 # 5.e-5
+lr_scheduler:      "constant_with_warmup"
+lr_warmup_steps:   0
+adam_weight_decay: 1.e-2
 scale_lr: false
-train_batch_size: 6
-gradient_accumulation_steps: 1
+train_batch_size: 4
+gradient_accumulation_steps: 32
 use_torch_compile: false # Compiling is slow or impossible with gradient checkpointing
 min_snr_gamma: 5
-ip_noise_gamma: 0.0
+ip_noise_gamma: 0.1
 channels_last: false
+rescale_cfg: 0.0
+
+# b1 channels last: 12.85 s/it
+# b1 no channels last: 10.46 s/it
 
 gradient_checkpointing: true
 
 max_train_epoch:      -1
-max_train_steps:      10000
+max_train_steps:      25600
 checkpointing_epochs: -1
-checkpointing_steps:  5000
+checkpointing_steps:  6400
+wandb_scale_factor:   1
 
-validation_steps:       500
-validation_steps_tuple: [1]
+validation_steps:       512
+validation_steps_tuple: [64, 256]
+
+# validation_steps:       20480
+# validation_steps_tuple: [2048, 10240]
 
 global_seed: 42
-mixed_precision_training: true
-enable_xformers_memory_efficient_attention: false
+mixed_precision_training: "fp16"
+enable_xformers_memory_efficient_attention: false # will fall back to SDP, don't worry
 
-is_debug: False
+is_debug: false
+do_profile: false

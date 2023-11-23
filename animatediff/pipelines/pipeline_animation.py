@@ -29,9 +29,22 @@ from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
 
+from .dynthresh_core import DynThresh
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+    """
+    Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
+    Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
+    """
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    # rescale the results from guidance (fixes overexposure)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
 
 @dataclass
 class AnimationPipelineOutput(BaseOutput):
@@ -330,6 +343,8 @@ class AnimationPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        guidance_rescale: float = 0.0,
+        dynamic_thresholding: DynThresh = None,
         **kwargs,
     ):
         # Default height and width to unet
@@ -366,7 +381,7 @@ class AnimationPipeline(DiffusionPipeline):
         timesteps = self.scheduler.timesteps
 
         # Prepare latent variables
-        num_channels_latents = self.unet.in_channels
+        num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
@@ -392,7 +407,7 @@ class AnimationPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
+                noise_pred = self.unet(latent_model_input.to(dtype=self.unet.dtype), t, encoder_hidden_states=text_embeddings.to(dtype=self.unet.dtype)).sample.to(dtype=latents_dtype)
                 # noise_pred = []
                 # import pdb
                 # pdb.set_trace()
@@ -404,7 +419,14 @@ class AnimationPipeline(DiffusionPipeline):
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    if dynamic_thresholding is not None:
+                        dynamic_thresholding.step = i
+                        noise_pred = dynamic_thresholding.dynthresh(noise_pred_text, noise_pred_uncond, guidance_scale, weights=None)
+                    else:
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        if guidance_rescale > 0.0:
+                            # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample

@@ -7,8 +7,7 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data.dataset import Dataset
 from animatediff.utils.util import zero_rank_print
-
-
+from PIL import Image
 
 class WebVid10M(Dataset):
     def __init__(
@@ -20,6 +19,7 @@ class WebVid10M(Dataset):
         zero_rank_print(f"loading annotations from {csv_path} ...")
         with open(csv_path, 'r') as csvfile:
             self.dataset = list(csv.DictReader(csvfile))
+        self.dataset = [video for video in self.dataset if os.path.exists(os.path.join(video_folder, f"{video['videoid']}.mp4"))];
         self.length = len(self.dataset)
         zero_rank_print(f"data scale: {self.length}")
 
@@ -27,12 +27,13 @@ class WebVid10M(Dataset):
         self.sample_stride   = sample_stride
         self.sample_n_frames = sample_n_frames
         self.is_image        = is_image
-        
+
         sample_size = tuple(sample_size) if not isinstance(sample_size, int) else (sample_size, sample_size)
+
         self.pixel_transforms = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
             transforms.Resize(sample_size[0], antialias=True),
             transforms.CenterCrop(sample_size),
+            transforms.RandomHorizontalFlip(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ])
     
