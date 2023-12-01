@@ -27,7 +27,7 @@ import torch.backends.cuda
 from torch.optim.optimizer import Optimizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, AutoencoderKLTemporalDecoder
 from diffusers.models import UNet2DConditionModel
 from diffusers.pipelines import StableDiffusionPipeline
 from diffusers.optimization import get_scheduler
@@ -204,7 +204,8 @@ def main(
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler(**OmegaConf.to_container(noise_scheduler_kwargs)) # type: DDIMScheduler
     prepare_scheduler_for_custom_training(noise_scheduler)
-    vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae") # type: AutoencoderKL
+    # vae          = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae") # type: AutoencoderKL
+    vae          = AutoencoderKLTemporalDecoder.from_pretrained("stabilityai/stable-video-diffusion-img2vid-xt", subfolder="vae") # type: AutoencoderKLTemporalDecoder
     tokenizer    = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer") # type: CLIPTokenizer
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder") # type: CLIPTextModel
     if not image_finetune:
@@ -376,7 +377,7 @@ def main(
             pretrained_model_path,
             unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler, safety_checker=None,
         )
-    validation_pipeline.enable_vae_slicing()
+    # validation_pipeline.enable_vae_slicing()
 
     dynthresh = DynThresh(
         mimic_scale=7.5,
@@ -388,9 +389,9 @@ def main(
         sched_val=None,
         experiment_mode=None,
         max_steps=25,
-        separate_feature_channels=True,
-        scaling_startpoint="MEAN",
-        variability_measure="AD",
+        separate_feature_channels=False,
+        scaling_startpoint="ZERO",
+        variability_measure="STD",
         interpolate_phi=1.0
     )
 
@@ -557,10 +558,6 @@ def main(
             grad_update_loss += loss.item()
             loss_accumulator += loss.item()
 
-            if global_step == 512:
-                for name, param in unet.named_parameters():
-                    if any(freeze_layer in name for freeze_layer in ["conv_"]):
-                        param.requires_grad = False
             ### <<<< Training <<<< ###
             
             # Wandb logging

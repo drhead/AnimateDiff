@@ -13,7 +13,7 @@ from packaging import version
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from diffusers.configuration_utils import FrozenDict
-from diffusers.models import AutoencoderKL
+from diffusers import AutoencoderKL, AutoencoderKLTemporalDecoder
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import (
     DDIMScheduler,
@@ -56,7 +56,7 @@ class AnimationPipeline(DiffusionPipeline):
 
     def __init__(
         self,
-        vae: AutoencoderKL,
+        vae: AutoencoderKLTemporalDecoder,
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
         unet: UNet3DConditionModel,
@@ -253,11 +253,11 @@ class AnimationPipeline(DiffusionPipeline):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        # video = self.vae.decode(latents).sample
-        video = []
-        for frame_idx in tqdm(range(latents.shape[0])):
-            video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
-        video = torch.cat(video)
+        video = self.vae.decode(latents, video_length).sample
+        # video = []
+        # for frame_idx in tqdm(range(latents.shape[0])):
+        #     video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
+        # video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16

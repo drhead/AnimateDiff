@@ -36,7 +36,7 @@ noise_scheduler_kwargs:
 
 train_data:
   csv_path:        "/mnt/foxhole/webvid_clean/results_2M_train.csv"
-  video_folder:    "/mnt/foxhole/webvid_clean_mt090"
+  video_folder:    "/mnt/foxhole/webvid_clean"
   sample_size:     512
   sample_stride:   4
   sample_n_frames: 16
@@ -55,18 +55,18 @@ validation_data:
   guidance_scale: 8.
 
 trainable_modules:
-  - "to_q"
-  - "proj_"
+  - "motion_modules."
 
-unet_checkpoint_path: "/mnt/sonic/AnimateDiff/models/Motion_Module/mm_sd_v15_v2.ckpt"
+# unet_checkpoint_path: "/mnt/sonic/AnimateDiff/models/Motion_Module/mm_sd_v15_v2.ckpt"
+unet_checkpoint_path: "/mnt/sonic/AnimateDiff/ZeroDiffusion-Animate-RC1-LayerStrip.ckpt"
 
 learning_rate:     1.0 # 5.e-5
 lr_scheduler:      "constant_with_warmup"
 lr_warmup_steps:   0
 adam_weight_decay: 1.e-2
 scale_lr: false
-train_batch_size: 4
-gradient_accumulation_steps: 32
+train_batch_size: 2
+gradient_accumulation_steps: 64
 use_torch_compile: false # Compiling is slow or impossible with gradient checkpointing
 min_snr_gamma: 5
 ip_noise_gamma: 0.1
@@ -79,13 +79,13 @@ rescale_cfg: 0.0
 gradient_checkpointing: true
 
 max_train_epoch:      -1
-max_train_steps:      25600
+max_train_steps:      51200
 checkpointing_epochs: -1
-checkpointing_steps:  6400
-wandb_scale_factor:   1
+checkpointing_steps:  12800
+wandb_scale_factor:   2
 
-validation_steps:       512
-validation_steps_tuple: [64, 256]
+validation_steps:       1024
+validation_steps_tuple: [128, 512]
 
 # validation_steps:       20480
 # validation_steps_tuple: [2048, 10240]
